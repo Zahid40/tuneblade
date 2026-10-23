@@ -1,0 +1,13 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Build output (rebuild with build.bat)
+build/
+dist/
+*.spec
+packaging/tuneblade.ico
+
+# Test artifacts
+received.wav

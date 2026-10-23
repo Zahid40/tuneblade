@@ -1,0 +1,8 @@
+numpy>=1.26
+soundcard>=0.4.3
+zeroconf>=0.130
+pystray>=0.19
+pillow>=10
+pychromecast>=14
+lameenc>=1.7
+qrcode>=7.4

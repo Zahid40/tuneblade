@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1e1f24">
+<title>TuneBlade</title>
+<style>
+  :root {
+    --bg: #1e1f24; --panel: #2a2c33; --fg: #e8e8ea; --dim: #9a9ca5;
+    --accent: #2f9cf4; --ok: #3ecf6e; --err: #ff6b6b; --track: #41444d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.4 "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  main { width: 100%; max-width: 380px; text-align: center; }
+  h1 { font-size: 26px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 14px; margin-bottom: 32px; }
+  #play {
+    width: 148px; height: 148px; border-radius: 50%; border: 0; cursor: pointer;
+    background: var(--accent); color: #fff; display: grid; place-items: center; margin: 0 auto 20px;
+    box-shadow: 0 10px 40px rgba(47,156,244,.35); transition: transform .1s, background .2s;
+  }
+  #play:active { transform: scale(.96); }
+  #play.on { background: var(--panel); box-shadow: none; }
+  #play svg { width: 56px; height: 56px; fill: currentColor; }
+  #status { min-height: 22px; font-size: 14px; color: var(--dim); margin-bottom: 28px; }
+  #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+  .card { background: var(--panel); border-radius: 12px; padding: 16px; text-align: left; margin-bottom: 12px; }
+  label { display: flex; justify-content: space-between; font-size: 13px; color: var(--dim); margin-bottom: 8px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; background: var(--bg); border-radius: 9px; padding: 4px; }
+  .modes button {
+    border: 0; border-radius: 7px; padding: 10px 6px; background: transparent; color: var(--dim);
+    font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .modes button.sel { background: var(--accent); color: #fff; }
+  .hint { font-size: 12px; color: var(--dim); margin-top: 8px; }
+  #latencyRow[hidden] { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TuneBlade</h1>
+  <div class="sub">Listen to this PC's audio on this device</div>
+
+  <button id="play" aria-label="Play">
+    <svg viewBox="0 0 24 24" id="icon"><path d="M8 5v14l11-7z"/></svg>
+  </button>
+  <div id="status">Tap to listen</div>
+
+  <div class="card">
+    <label>Volume <span id="volVal">100%</span></label>
+    <input id="vol" type="range" min="0" max="100" value="100">
+  </div>
+
+  <div class="card">
+    <label>Mode</label>
+    <div class="modes">
+      <button data-mode="live" class="sel">Low latency</button>
+      <button data-mode="bg">Background</button>
+    </div>
+    <div class="hint" id="modeHint">Best for video. Keep this tab open and the screen on.</div>
+    <div id="latencyRow" style="margin-top:14px">
+      <label>Buffer <span id="bufVal">300 ms</span></label>
+      <input id="buf" type="range" min="80" max="2000" step="20" value="300">
+      <div class="hint">Raise it if the sound stutters on weak Wi-Fi.</div>
+    </div>
+  </div>
+</main>
+
+<audio id="bgAudio" preload="none"></audio>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PLAY = '<path d="M8 5v14l11-7z"/>';
+const STOP = '<path d="M7 7h10v10H7z"/>';
+const RATE = 44100;
+
+let mode = localStorage.getItem('tb-mode') || 'live';
+let playing = false;
+let ctx = null, gain = null, abort = null, nextTime = 0, wakeLock = null, gen = 0;
+let target = Number(localStorage.getItem('tb-buf') || 300) / 1000;
+
+function status(text, cls = '') { const s = $('status'); s.textContent = text; s.className = cls; }
+
+function setMode(m) {
+  mode = m; localStorage.setItem('tb-mode', m);
+  document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('sel', b.dataset.mode === m));
+  $('latencyRow').hidden = m !== 'live';
+  $('modeHint').textContent = m === 'live'
+    ? 'Best for video. Keep this tab open and the screen on.'
+    : 'Keeps playing with the screen off. About 2–5 s behind.';
+  if (playing) { stop(); start(); }
+}
+
+// ---- Low latency: raw PCM over fetch, scheduled with Web Audio ----------
+async function startLive() {
+  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE, latencyHint: 'interactive' });
+  await ctx.resume();
+  if (!gain) { gain = ctx.createGain(); gain.connect(ctx.destination); }
+  gain.gain.value = $('vol').value / 100;
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) {}
+
+  const me = ++gen;  // a stop/start bumps gen, retiring older loops
+  const alive = () => playing && mode === 'live' && me === gen;
+  while (alive()) {
+    abort = new AbortController();
+    try {
+      status('Connecting…');
+      const resp = await fetch('/pcm', { cache: 'no-store', signal: abort.signal });
+      if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      let carry = new Uint8Array(0);
+      nextTime = 0;
+      status('Playing', 'ok');
+      while (alive()) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error('stream ended');
+        let buf = value;
+        if (carry.length) { const m = new Uint8Array(carry.length + buf.length); m.set(carry); m.set(buf, carry.length); buf = m; }
+        const usable = buf.length - (buf.length % 4);
+        carry = buf.slice(usable);
+        if (usable) schedule(buf.buffer.slice(buf.byteOffset, buf.byteOffset + usable));
+      }
+    } catch (e) {
+      if (!alive()) break;
+      status('Reconnecting…', 'err');
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+}
+
+function schedule(bytes) {
+  const pcm = new Int16Array(bytes);
+  const frames = pcm.length / 2;
+  const ab = ctx.createBuffer(2, frames, RATE);
+  const L = ab.getChannelData(0), R = ab.getChannelData(1);
+  for (let i = 0, j = 0; i < frames; i++, j += 2) { L[i] = pcm[j] / 32768; R[i] = pcm[j + 1] / 32768; }
+  const now = ctx.currentTime;
+  if (nextTime < now + 0.01) nextTime = now + target;          // underrun: rebuild the cushion
+  else if (nextTime > now + target + 0.4) return;               // too far behind live: drop to catch up
+  const src = ctx.createBufferSource();
+  src.buffer = ab; src.connect(gain); src.start(nextTime);
+  nextTime += ab.duration;
+}
+
+// ---- Background: plain <audio> MP3 stream (survives screen-off) ---------
+async function startBg() {
+  const a = $('bgAudio');
+  a.src = '/stream.mp3?t=' + Date.now();
+  a.volume = $('vol').value / 100;
+  status('Buffering…');
+  a.onplaying = () => status('Playing', 'ok');
+  a.onerror = () => { if (playing) { status('Reconnecting…', 'err'); setTimeout(() => playing && mode === 'bg' && startBg(), 1500); } };
+  a.onended = a.onerror;
+  try { await a.play(); } catch (e) { status('Tap play again', 'err'); }
+}
+
+function start() {
+  playing = true;
+  $('play').classList.add('on'); $('icon').innerHTML = STOP;
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: 'TuneBlade', artist: 'PC audio' });
+    navigator.mediaSession.setActionHandler('pause', stop);
+    navigator.mediaSession.setActionHandler('stop', stop);
+  }
+  (mode === 'live' ? startLive : startBg)();
+}
+
+function stop() {
+  playing = false;
+  gen++;
+  $('play').classList.remove('on'); $('icon').innerHTML = PLAY;
+  abort?.abort(); abort = null;
+  const a = $('bgAudio'); a.pause(); a.removeAttribute('src'); a.load();
+  if (ctx) ctx.suspend();
+  nextTime = 0;
+  wakeLock?.release?.(); wakeLock = null;
+  status('Stopped');
+}
+
+$('play').onclick = () => (playing ? stop() : start());
+document.querySelectorAll('.modes button').forEach(b => b.onclick = () => setMode(b.dataset.mode));
+$('vol').oninput = (e) => {
+  const v = e.target.value / 100;
+  $('volVal').textContent = e.target.value + '%';
+  if (gain) gain.gain.value = v;
+  $('bgAudio').volume = v;
+};
+$('buf').value = target * 1000;
+$('bufVal').textContent = Math.round(target * 1000) + ' ms';
+$('buf').oninput = (e) => {
+  target = e.target.value / 1000;
+  $('bufVal').textContent = e.target.value + ' ms';
+  localStorage.setItem('tb-buf', e.target.value);
+};
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && playing && mode === 'live') {
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) {}
+  }
+});
+setMode(mode);
+</script>
+</body>
+</html>
